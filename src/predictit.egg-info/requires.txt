@@ -1,0 +1,7 @@
+selenium
+redis
+pytz
+python-dateutil
+tweepy
+setuptools
+mechanicalsoup

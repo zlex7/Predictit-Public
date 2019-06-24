@@ -1,0 +1,534 @@
+# Imports
+import time
+import json
+import codecs
+import pytz
+import logging
+import urllib.request as urllib
+from urllib.error import *
+from time import sleep
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from predictit.models import *
+from datetime import datetime
+import dateutil.parser
+from predictit.exceptions import *
+import requests
+import mechanicalsoup
+import tweepy
+import bs4
+	#def get_volume_for_time_period(self, unit, quantity):
+	#	order_book = self.browser.get('https://www.predictit.org/api/Trade/7800/OrderBook').json()
+
+'''
+Provides fast and convenient access to the PredictIt API.
+Data can be extracted in JSON/CSV format.
+
+getHTML()
+getJSON(makeFile=False)
+makeJSON(data, staticInfo=False, makeFile=False)
+makeCSV(data, staticInfo=False)
+'''
+
+
+class PredictItAPI(object):
+
+    # Static Variables
+    API_URL = 'https://www.predictit.org/api/marketdata/all/'
+    STATIC_KEYS = ['id', 'longName', 'shortName', 'dateEnd', 'url']
+    DYNAMIC_KEYS = ['timeStamp', 'bestBuyYesCost', 'bestBuyNoCost', 'bestSellYesCost', 'bestSellNoCost', 'lastTradePrice', 'lastClosePrice']
+    EXTRA_DYNAMIC_KEYS = ['sharesTraded', 'todaysVolume', 'totalShares', 'todaysChange',
+                    'buyYesData', 'sellYesData']
+
+    HEADLESS_OPTIONS = Options()
+    HEADLESS_OPTIONS.add_argument("--headless")
+    HEADLESS_OPTIONS.add_argument("--window-size=1920x1080")
+    driver = None
+
+    TWITTER_CONSUMER_TOKEN ='E4XE7HZpccBapWGF5GUXfq5te'
+    TWITTER_CONSUMER_SECRET = 'nFC65tDTRhxNtnVgzBzuCNsvP5KVFtjXOLd7zoDZHVNEwyI1zF'
+    TWITTER_ACCESS_TOKEN = '1087850698937696257-vskw9aSreKjkmBOeGccc5oNNKkWWIs'
+    TWITTER_ACCESS_TOKEN_SECRET = 'oguqjLZYm908DlEY46pL3gZkViWf3ndNjLgo5EQdyhffA'
+
+    def __init__(self):
+        # consumer_token, consumer_secret, app_token, app_secret):
+        # auth = tweepy.OAuthHandler(TWITTER_CONSUMER_TOKEN, TWITTER_CONSUMER_SECRET)
+        # auth.access_token = TWITTER_ACCESS_TOKEN
+        # auth.access_token_secret = TWITTER_ACCESS_TOKEN_SECRET
+        # self.api = tweepy.API(auth)
+
+        self.browser = mechanicalsoup.Browser()
+        self.browser.session.headers.update({
+		  'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36\
+		   (KHTML, like Gecko) Chrome/54.0.2840.100 Safari/537.36'}
+		)
+        self.available = None
+        self.access_token = None
+
+    def update_balances(self):
+        r = self.browser.get(
+        	     'https://www.predictit.org/api/Account/Status')
+        user_funds = r.json()
+        logging.info('REQUEST: /Account/Status, received status code = %d, content = %s' % (r.status_code,user_funds))
+        self.available = int(user_funds['accountBalanceDecimal'] * 100)
+        logging.info('updated balance to %d' % self.available)
+        	#self.gain_loss = user_funds['SharesText']
+        	#self.invested = user_funds['PortfolioText']
+
+    def money_available(self):
+        self.update_balances()
+        print(f"You have {self.available} available.")
+
+    def max_num_shares_buyable_at_price(self, price):
+        balance = self.available
+        max_num_shares = int(balance / 99)
+        logging.info('calculated max shares of %d for a balance of %d and price of %d cents' % (max_num_shares,balance,price))
+        return max_num_shares
+
+    def __validate_login(self, response):
+        assert 'access_token' in str(response.content), "Invalid login."
+
+    def create_authed_session(self, username, password):
+        logging.info('creating new authed session')
+        login_page = self.browser.get('https://www.predictit.org')
+        r = self.browser.post('https://www.predictit.org/api/Account/token',
+        		{'email': username,
+        		'password': password,
+        		'grant_type': 'password',
+        		'rememberMe': 'false'})
+        self.__validate_login(r)
+        self.access_token = r.json()['access_token']
+        self.browser.session.headers.update({'Authorization': 'Bearer %s' % self.access_token})
+        self.update_balances()
+        return self.browser
+
+    def get_order_book_for_contract(self, cid):
+        order_book = self.browser.get('https://www.predictit.org/api/Trade/7800/OrderBook').json()
+        return order_book
+
+    def buy_order(self, cid, is_yes_order, quantity, price):
+        logging.info('executing buy order at cid=%d, quantity=%d, price=%d, order type=%s' % (cid, quantity, price, 'yes' if is_yes_order else 'no'))
+        max_quantity = self.max_num_shares_buyable_at_price(price)
+        if quantity > max_quantity:
+            logging.warning('quantity "%d" was greater than max quantity "%d", reset' % (quantity, max_quantity))
+            quantity = max_quantity
+        trade_info = {
+        		'quantity': quantity,
+        		'pricePerShare': price,
+        		'contractId': cid,
+        		'tradeType': 1 if is_yes_order else 0
+        }
+        r = self.browser.post('https://www.predictit.org/api/Trade/ConfirmTrade', trade_info)
+        logging.info('REQUEST: ConfirmTrade, received status code = %d, content=%s' % (r.status_code, r.content))
+        r = self.browser.post('https://www.predictit.org/api/Trade/SubmitTrade', trade_info)
+        logging.info('REQUEST: SubmitTrade, received status code = %d, content=%s' % (r.status_code, r.content))
+        self.update_balances()
+        # logging.info(r.content)
+
+    # def sell_order(self, cid, is_yes_order, quantity, price):
+    #     logging.info('starting sell order at cid=%d, quantity=%d, price=%d, order type=%s...' % (cid, quantity, price, 'yes' if is_yes_order else 'no'))
+    #     # max_quantity = self.max_num_shares_buyable_at_price(price)
+    #     if quantity > max_quantity:
+    #         logging.warning('quantity "%d" was greater than max quantity "%d", reset' % (quantity, max_quantity))
+    #         quantity = max_quantity
+    #     trade_info = {
+    #     		'quantity': quantity,
+    #     		'pricePerShare': price,
+    #     		'contractId': cid,
+    #     		'tradeType': 1 if is_yes_order else 0
+    #     }
+    #     r = self.browser.post('https://www.predictit.org/api/Trade/ConfirmTrade', trade_info)
+    #     logging.info(r.content)
+    #     r = self.browser.post('https://www.predictit.org/api/Trade/SubmitTrade', trade_info)
+    #     self.update_balances()
+    #     logging.info(r.content)
+
+
+    '''Returns an HTML copy of the PredictIt API webpage using a non-headless Selenium browser'''
+    def getHTML(self):
+        self.driver = webdriver.Chrome(chrome_options=self.HEADLESS_OPTIONS)
+        self.driver.get(self.API_URL)
+        self.driver.find_element_by_tag_name('MarketList')   # Wait until site is fully loaded
+        html = self.driver.page_source
+
+        print('Completed: getHTML')
+        return html
+
+    def getRunningMarkets(self, twitter_markets_given_info):
+        api_json = self.getJSON()
+
+        markets = []
+
+        for market_dict in api_json:
+            # print(market_dict)
+            market = None
+            for tmgf in twitter_markets_given_info:
+                if market_dict['name'] == tmgf[0]:
+                    market = TwitterMarket(ticker_symbol=market_dict['id'], long_name=market_dict['name'], short_name=market_dict['shortName'],
+                                image_url=market_dict['image'], url=market_dict['url'], status=market_dict['status'], target_twitter_account=tmgf[1],
+                                 starting_num_tweets=tmgf[2])
+            if market is None:
+                market = Market(ticker_symbol=market_dict['id'], long_name=market_dict['name'], short_name=market_dict['shortName'],
+                        image_url=market_dict['image'], url=market_dict['url'], status=market_dict['status'])
+            for contract_dict in market_dict['contracts']:
+                # print(json.dumps(contract_dict,indent=4))
+                contract = None
+                if isinstance(market, TwitterMarket):
+                    contract = Contract(ticker_symbol=contract_dict['id'], long_name=contract_dict['longName'],
+                                    short_name=contract_dict['shortName'],
+                                    time_end=contract_dict['dateEnd'] if contract_dict['dateEnd'] == 'N/A' else dateutil.parser.parse(contract_dict['dateEnd']).timestamp(),
+                                    image_url=contract_dict['image'], status=contract_dict['status'])
+                market.contracts.append(contract)
+            markets.append(market)
+        return markets
+
+    TRUMP_PAGE_URL = ""
+    # def getNumTweetsGenericFromSpecificDate(self, date_time, url):
+    #
+    #
+    # def getNumTrumpTweetsFromSpecificDate(self, date_time):
+    #     return self.getNumTweetsGenericFromSpecificDate(date_time, )
+
+    def getNumPotusTweets(self):
+        logging.info('getting number of potus tweets...')
+        r = requests.get('https://twitter.com/potus')
+        html = r.content
+        logging.info('REQUEST: https://twitter.com/potus, received status code = %d, content = %s' % (r.status_code,''))
+        soup = bs4.BeautifulSoup(html, 'lxml')
+        results = soup.findAll('a', {'data-nav': 'tweets'})
+        elem = results[0]
+        target = elem.findAll('span', {'class': 'ProfileNav-value'})[0]
+        num_tweets = int(target['data-count'])
+        logging.info('returning %d tweets for POTUS' % num_tweets)
+        return num_tweets
+
+    def getNumWhitehouseTweets(self):
+        logging.info('getting number of whitehouse tweets...')
+        r = requests.get('https://twitter.com/whitehouse')
+        html = r.content
+        logging.info('REQUEST: https://twitter.com/whitehouse, received status code = %d, content = %s' % (r.status_code,''))
+        soup = bs4.BeautifulSoup(html, 'lxml')
+        results = soup.findAll('a', {'data-nav': 'tweets'})
+        elem = results[0]
+        target = elem.findAll('span', {'class': 'ProfileNav-value'})[0]
+        num_tweets = int(target['data-count'])
+        logging.info('returning %d tweets for WHITEHOUSE' % num_tweets)
+        return num_tweets
+
+    def getNumPenceTweets(self):
+        logging.info('getting number of pence tweets...')
+        r = requests.get('https://twitter.com/vp')
+        html = r.content
+        logging.info('REQUEST: https://twitter.com/vp, received status code = %d, content = %s' % (r.status_code,''))
+        soup = bs4.BeautifulSoup(html, 'lxml')
+        results = soup.findAll('a', {'data-nav': 'tweets'})
+        elem = results[0]
+        target = elem.findAll('span', {'class': 'ProfileNav-value'})[0]
+        num_tweets = int(target['data-count'])
+        logging.info('returning %d tweets for PENCE' % num_tweets)
+        return num_tweets
+
+    def getNumTrumpTweets(self):
+        logging.info('getting number of trump tweets...')
+        r = requests.get('https://twitter.com/realDonaldTrump')
+        html = r.content
+        logging.info('REQUEST: https://twitter.com/realDonaldTrump, received status code = %d, content = %s' % (r.status_code,''))
+        soup = bs4.BeautifulSoup(html, 'lxml')
+        results = soup.findAll('a', {'data-nav': 'tweets'})
+        elem = results[0]
+        target = elem.findAll('span', {'class': 'ProfileNav-value'})[0]
+        num_tweets = int(target['data-count'])
+        logging.info('returning %d tweets for TRUMP' % num_tweets)
+        return num_tweets
+
+    def getLatestTrumpTweets(self):
+        html = requests.get('https://twitter.com/realDonaldTrump').content
+        soup = bs4.BeautifulSoup(html, 'lxml')
+        return None
+
+    def getCurrentContractsInfo(self):
+        api_json = self.getJSON()
+        print(api_json)
+        contracts_info = []
+
+        for market in api_json:
+            for contract_info_dict in market['contracts']:
+                naive_dt = dateutil.parser.parse(market['timeStamp'])
+                tz = pytz.timezone('US/Eastern')
+                eastern_dt = tz.normalize(tz.localize(naive_dt))
+
+                best_buy_yes_cost = contract_info_dict['bestBuyYesCost']
+                best_buy_no_cost = contract_info_dict['bestBuyNoCost']
+                best_sell_yes_cost = contract_info_dict['bestSellYesCost']
+                best_sell_no_cost = contract_info_dict['bestSellNoCost']
+                last_trade_price = contract_info_dict['lastTradePrice']
+                last_close_price = contract_info_dict['lastClosePrice']
+
+                if best_buy_yes_cost is None:
+                    best_buy_yes_cost = -1
+                else:
+                    best_buy_yes_cost = int(float(best_buy_yes_cost) * 100)
+                if best_buy_no_cost is None:
+                    best_buy_no_cost = -1
+                else:
+                    best_buy_no_cost = int(float(best_buy_no_cost) * 100)
+                if best_sell_yes_cost is None:
+                    best_sell_yes_cost = -1
+                else:
+                    best_sell_yes_cost = int(float(best_sell_yes_cost) * 100)
+                if best_sell_no_cost is None:
+                    best_sell_no_cost = -1
+                else:
+                    best_sell_no_cost = int(float(best_sell_no_cost) * 100)
+                if last_trade_price is None:
+                    last_trade_price = -1
+                else:
+                    last_trade_price = int(float(last_trade_price) * 100)
+                if last_close_price is None:
+                    last_close_price = -1
+                else:
+                    last_close_price = int(float(last_close_price) * 100)
+
+                contract_info = ContractInfo(ticker_symbol=contract_info_dict['id'], best_buy_yes_cost= best_buy_yes_cost,
+                                                best_buy_no_cost=best_buy_no_cost,  best_sell_yes_cost=best_sell_yes_cost,
+                                                best_sell_no_cost=best_sell_no_cost, last_trade_price=last_trade_price,last_close_price=last_close_price,
+                                                timestamp=eastern_dt.timestamp(), timestamp_as_date=eastern_dt)
+                # timestamp=datetime.strptime(market['TimeStamp'], '%Y-%m-%dT%H:%M:%S.%f'))
+                contracts_info.append(contract_info)
+
+        return contracts_info
+
+    '''Returns a JSON copy of the PredictIt API webpage using a headless urllib browser'''
+    def getJSON(self, makeFile=False):
+        try:
+            data = urllib.urlopen(self.API_URL).read()  # Gets only the visible page text
+        except URLError:
+            raise APIError()
+        data = json.loads(data)                     # Converts to JSON
+        # print("JSON data from API = %s" % data)
+        # print ("adsdiofjsf")
+        # logging.warning ("abdfsdf please show up")
+        data = data['markets']                      # Access only the 'Markets' information
+
+        if makeFile:
+            codecs.open('markets.json', 'w', encoding='utf8').write(json.dumps(data, indent=4))
+
+        print('Completed: getJSON')
+        return data
+
+    '''Separates the JSON output into each contract's static and dynamic components.
+    Returns the separated JSON data and makes a file if requested.'''
+    def makeJSON(self, data, staticInfo=False, makeFile=False):
+
+        # self.driver = webdriver.Chrome(chrome_options=self.HEADLESS_OPTIONS)
+        fileName = ""
+        result = []
+        keys = []
+
+        if (staticInfo):
+            keys = API.STATIC_KEYS
+            fileName = "static.json"
+
+        else:
+            keys = []
+            keys.extend(API.DYNAMIC_KEYS)
+            keys.remove('timeStamp')                # Prevents an error; already accounted for in line 56
+            fileName = "dynamic.json"
+
+        for market in data[:2]:
+            for contract in market['contracts']:
+                try:
+                    contract_info = {}
+                    contract_info['timeStamp'] = market['timeStamp']
+
+                    for key in keys:
+                        contract_info[key] = contract[key]
+
+                    contract_info = self.getMarketPageData(contract_info, contract['url'])
+                    result.append(contract_info)
+
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
+
+        if makeFile:
+            codecs.open(fileName, 'w+', encoding='utf8').write(json.dumps(result, indent=4))
+
+        print('Completed: makeJSON')
+        return result
+
+    '''Accesses Market-Pages to access more specific values. Returns an updated contract_info variable.'''
+    def getMarketPageData(self, contract_info, URL):
+
+        self.driver.get(URL)
+
+        table = self.driver.find_
+element_by_xpath("//TABLE[@class='table table-condensed table-striped table-info']")
+        values = table.find_elements_by_tag_name("td")
+        values = [value.get_attribute('innerHTML') for value in values]
+        values = values[-8:]
+        try:
+            contract_info["sharesTraded"] = values[1].split(",")[0]
+            contract_info["todaysVolume"] = values[3].split(",")[0]
+            contract_info["totalShares"] = values[5].split(",")[0]
+            contract_info["todaysChange"] = values[7].split("<")[0]
+
+        except Exception as e:
+            print("---")
+            print(URL)
+            print(e.message)
+
+            for i, v  in enumerate(values):
+                print(i)
+                print(v)
+                print("\n")
+            print("---")
+
+        if values[7] == "NC":       # No change
+            contract_info["TodaysChange"] = 0
+
+        self.driver.find_element_by_id("getPrices").click()
+        WebDriverWait(self.driver, 3).until(EC.presence_of_element_located((By.XPATH, "(//DIV[@class='col-lg-5 col-md-5'])[2]")))
+
+        yesTable = self.driver.find_element_by_xpath("(//DIV[@class='col-lg-5 col-md-5'])[2]")
+        yesValues = yesTable.find_elements_by_tag_name("td")
+        yesValues = [yesValue.get_attribute('innerText') for yesValue in yesValues]
+        yesValues = yesValues[5:]
+
+        buyYesPrices = yesValues[0::5]
+        buyYesShares = yesValues[1::5]
+        sellYesPrices = yesValues[3::5]
+        sellYesShares = yesValues[4::5]
+
+        buyYesPrices = [buyYesPrice[:-1] for buyYesPrice in buyYesPrices]
+        sellYesPrices = [sellYesPrice[:-1] for sellYesPrice in sellYesPrices]
+
+        buyYesPrices = [0 if value == '' else value for value in buyYesPrices]
+        buyYesShares = [0 if value == '' else value for value in buyYesShares]
+        sellYesPrices = [0 if value == '' else value for value in sellYesPrices]
+        sellYesShares = [0 if value == '' else value for value in sellYesShares]
+
+        buyYesPrices = map(int, buyYesPrices)
+        buyYesShares = map(int, buyYesShares)
+        sellYesPrices = map(int, sellYesPrices)
+        sellYesShares = map(int, sellYesShares)
+
+        # noTable = self.driver.find_element_by_xpath("(//DIV[@class='col-lg-5 col-md-5'])[3]")
+        # noValues = noTable.find_elements_by_tag_name("td")
+        # noValues = [noValue.get_attribute('innerText') for noValue in noValues]
+        # noValues = noValues[5:]
+        #
+        # buyNoPrices = noValues[0::5]
+        # buyNoShares = noValues[1::5]
+        # sellNoPrices = noValues[3::5]
+        # sellNoShares = noValues[4::5]
+        #
+        # buyNoPrices = [buyNoPrice[:-1] for buyNoPrice in buyNoPrices]
+        # sellNoPrices = [sellNoPrice[:-1] for sellNoPrice in sellNoPrices]
+        #
+        # buyNoPrices = [0 if value == '' else value for value in buyNoPrices]
+        # buyNoShares = [0 if value == '' else value for value in buyNoShares]
+        # sellNoPrices = [0 if value == '' else value for value in sellNoPrices]
+        # sellNoShares = [0 if value == '' else value for value in sellNoShares]
+        #
+        # buyNoPrices = map(int, buyNoPrices)
+        # buyNoShares = map(int, buyNoShares)
+        # sellNoPrices = map(int, sellNoPrices)
+        # sellNoShares = map(int, sellNoShares)
+
+        buyYesData = dict(zip(buyYesPrices, buyYesShares))
+        sellYesData = dict(zip(sellYesPrices, sellYesShares))
+        # buyNoData = dict(zip(buyNoPrices, buyNoShares))
+        # sellNoData = dict(zip(sellNoPrices, sellNoShares))
+
+        contract_info['buyYesData'] = buyYesData
+        contract_info['sellYesData'] = sellYesData
+        # contract_info['BuyNoData'] = buyNoData
+        # contract_info['SellNoData'] = sellNoData
+
+        return contract_info
+
+    '''Converts the JSON data into a CSV file.'''
+    def makeCSV(self, data, staticInfo=False):
+        fileName = ""
+        keys = []
+
+        if (staticInfo):
+            keys = API.STATIC_KEYS
+            fileName = "static.csv"
+
+        else:
+            keys = API.DYNAMIC_KEYS
+            fileName = "dynamic.csv"
+
+        file = codecs.open(fileName, 'w+', encoding='utf8')
+
+        # Static info requires quotation marks around each value
+        if staticInfo:
+            entry = []
+            for key in keys:
+                entry.append("'%s'" % key)
+            entry = ",".join(entry)
+            file.write(entry + "\n")
+
+            for contract in data:
+                entry = []                          # Contract entry
+                for key in keys:
+                    if contract[key] != None:       # Replace null values with empty strings so database can process
+                        entry.append("'%s'" % contract[key])
+
+                    else:
+                        entry.append("''")
+
+                entry = ",".join(entry)
+                file.write(entry + "\n")
+
+        # Dynamic info does not require quotation marks
+        else:
+            entry = []
+            for key in keys:
+                entry.append("%s" % key)
+
+            entry = ",".join(entry)
+            file.write(entry + "\n")
+
+            for contract in data:
+                entry = []                          # Contract entry
+                for index, key in enumerate(keys):
+                    if contract[key] != None:       # Replace null values with empty strings so database can process
+                        try:                        # If value is number, multiple by 100
+                            if (contract[key] < 1):
+                                contract[key] = int(contract[key]*100)
+                        except:
+                            pass
+                        entry.append("%s" % contract[key])
+
+                    else:
+                        entry.append("")
+
+                entry = ",".join(entry)
+                file.write(entry + "\n")
+
+        file.close()
+        print('Completed: makeCSV')
+
+
+# t0 = time.time()
+# # --
+# # Collect data
+# API = API()
+# JSON = API.getJSON()
+#
+# # Build static information
+# # STATIC_INFO = API.makeJSON(JSON, staticInfo=True)
+# # API.makeCSV(STATIC_INFO, staticInfo=True)
+#
+# # Build dynamic information
+# DYNAMIC_INFO = API.makeJSON(JSON, staticInfo=False, makeFile=True)
+# # API.makeCSV(DYNAMIC_INFO, staticInfo=False)
+# # --
+# t1 = time.time()
+# print(t1-t0)
