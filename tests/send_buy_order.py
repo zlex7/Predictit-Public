@@ -10,9 +10,10 @@ QUANTITY = 1
 PRICE = 99
 
 def send_buy_order():
-    notifier = PredictItNotifier("alex.wlezien@gmail.com", "houston98", ["a.wlezien@gmail.com", "alex.dai816@gmail.com"])
+    notifier = PredictItNotifier("alex.wlezien@gmail.com", "PASSWORD", ["a.wlezien@gmail.com", "alex.dai816@gmail.com"])
     api = PredictItAPI(notifier)
-    api.create_authed_session('buyaclweed@gmail.com','Houston98')
+    api.create_authed_session('buyaclweed@gmail.com','PASSWORD')
+
     api.buy_order(CONTRACT_ID, IS_YES_ORDER, QUANTITY, PRICE)
 
 
